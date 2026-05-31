@@ -1,0 +1,51 @@
+{
+  "expo": {
+    "name": "Expenzo",
+    "slug": "expenzo-client",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0F0F12"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Expenzo uses your microphone to record voice expense logs.",
+        "NSCameraUsageDescription": "Expenzo uses the camera for profile photos."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0F0F12"
+      },
+      "permissions": [
+        "RECORD_AUDIO",
+        "RECEIVE_BOOT_COMPLETED",
+        "VIBRATE"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/icon.png",
+          "color": "#A5B4FC"
+        }
+      ],
+      [
+        "expo-av",
+        {
+          "microphonePermission": "Expenzo needs microphone access to record voice expense logs."
+        }
+      ]
+    ]
+  }
+}
