@@ -1,178 +1,249 @@
 import logging
 import json
+import os
+import tempfile
+import datetime
+from dotenv import load_dotenv
+load_dotenv()
+
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
+from faster_whisper import WhisperModel
 
-# Configure logging
+# ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("voice_service")
 
-# 1. Define the Pydantic schema class matching what main.py expects
+
+# ─── Pydantic schema for structured Gemini text extraction ───────────────────
 class ExpenseExtraction(BaseModel):
     amount: int
     category: str
     date: str
 
-# ─── Gemini-native audio MIME type table ─────────────────────────────────────
-# Gemini 2.5 Flash natively supports: audio/wav, audio/mp3, audio/aiff,
-# audio/aac, audio/ogg, audio/flac via Part.from_bytes (inline data path).
-#
-# Mobile containers NOT natively supported by the API:
-#   • .m4a  (audio/m4a)  → remapped to audio/aac  (AAC is the codec inside M4A)
-#   • .3gp  (audio/3gpp) → remapped to audio/aac  (AAC-LC is the standard 3GPP codec)
-#   • .3gpp (audio/3gpp) → remapped to audio/aac
-#
-# Unknown extensions fall back to audio/mp3, which Gemini parses as raw byte
-# chunks without enforcing a strict container boundary.
-_AUDIO_MIME_MAP: dict[str, str] = {
-    # iOS mobile container — AAC codec inside an MPEG-4 wrapper
-    "m4a":  "audio/aac",
-    # Android LOW_QUALITY containers — AAC-LC codec inside a 3GPP wrapper
-    "3gp":  "audio/aac",
-    "3gpp": "audio/aac",
-    # Natively supported containers — pass through unchanged
-    "aac":  "audio/aac",
-    "mp3":  "audio/mp3",
-    "wav":  "audio/wav",
-    "aiff": "audio/aiff",
-    "ogg":  "audio/ogg",
-    "flac": "audio/flac",
-    # webm/opus → ogg container is the closest Gemini-native equivalent
-    "webm": "audio/ogg",
-}
 
-# Containers whose file extension differs from the Gemini-native MIME alias
-# used, so we can emit an informative remap warning in the log.
-_REMAPPED_EXTENSIONS: frozenset[str] = frozenset({"m4a", "3gp", "3gpp", "webm"})
+# ═════════════════════════════════════════════════════════════════════════════
+# STEP 1 — LOCAL WHISPER STT
+# ─────────────────────────────────────────────────────────────────────────────
+# The WhisperModel is loaded lazily on the first call to avoid a slow startup
+# when the module is imported. The `base` model (~145 MB) is downloaded to
+# ~/.cache/huggingface/hub/ on first use and reused on subsequent runs.
+# ═════════════════════════════════════════════════════════════════════════════
+
+_whisper_model: WhisperModel | None = None
 
 
-def _resolve_mime_type(filename: str) -> str:
+def _get_whisper_model() -> WhisperModel:
     """
-    Derive a Gemini-natively-supported audio MIME type from the file extension.
+    Returns a lazily-loaded, cached WhisperModel instance.
 
-    Unsupported mobile containers (.m4a, .3gp, .3gpp) are transparently remapped
-    to ``audio/aac`` — the codec those containers carry — so Gemini 2.5 Flash
-    can parse the raw audio byte stream without rejecting the request.
-    Unknown extensions fall back to ``audio/mp3`` (raw chunk fallback).
+    Uses the 'base' model on CPU with int8 quantization for a good
+    balance of accuracy and speed on any developer machine.
+    First call takes a few seconds to download (~145 MB) and initialize.
+    Subsequent calls return the cached instance immediately.
     """
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    resolved = _AUDIO_MIME_MAP.get(ext, "audio/mp3")  # raw chunk fallback
-
-    if ext in _REMAPPED_EXTENSIONS:
-        logger.warning(
-            f"Container '{ext}' is not natively supported by Gemini Part.from_bytes — "
-            f"remapping '{filename}' from unsupported container to Gemini-native "
-            f"equivalent mime_type='{resolved}' for transparent byte-stream parsing."
-        )
-    else:
-        logger.info(
-            f"Resolved Gemini-native MIME type '{resolved}' "
-            f"from filename '{filename}' (ext='{ext}')."
-        )
-    return resolved
+    global _whisper_model
+    if _whisper_model is None:
+        logger.info("[Whisper] Loading faster-whisper 'tiny' model (first-run download ~75 MB)...")
+        _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+        logger.info("[Whisper] Model loaded and ready.")
+    return _whisper_model
 
 
-# ─── Lazy GenAI client ────────────────────────────────────────────────────────
-# Instantiated on first call to avoid module-load crashes when API key is absent.
-_client = None
-
-def get_genai_client():
-    global _client
-    if _client is None:
-        try:
-            _client = genai.Client()
-        except Exception as e:
-            logger.error(f"Failed to initialize GenAI client: {e}. Make sure GOOGLE_API_KEY environment variable is set.")
-            raise
-    return _client
-
-
-def process_voice_audio(audio_bytes: bytes, filename: str = "audio_upload.wav") -> dict:
+def transcribe_audio_locally(audio_bytes: bytes, filename: str = "audio_upload.wav") -> str:
     """
-    Processes voice audio bytes to transcribe and extract expense details
-    (amount, category, date) using the Google GenAI SDK with gemini-2.5-flash.
+    Transcribes raw audio bytes using the local faster-whisper model.
 
-    The ``audio_bytes`` buffer is passed inline via ``types.Part.from_bytes``
-    with a Gemini-natively-supported MIME type resolved from ``filename``.
-    Unsupported mobile containers (.m4a → audio/aac, .3gp → audio/aac) are
-    transparently remapped so the model can parse the raw codec stream directly.
-
-    Structured output is enforced via ``response_schema=ExpenseExtraction``
-    (Pydantic), guaranteeing a type-safe dict with 'amount' (int),
-    'category' (str), and 'date' (str) keys in the returned payload.
+    Writes the bytes to a temporary file on disk (faster-whisper requires a
+    file path rather than a bytes buffer). The temp file is deleted after
+    transcription completes.
 
     Args:
-        audio_bytes: Raw binary content read from the UploadFile memory buffer.
-        filename:    Original upload filename used to resolve the Gemini-native
-                     MIME type. Defaults to 'audio_upload.wav'.
+        audio_bytes: Raw binary content of the recorded audio file.
+        filename:    Original filename used to derive the file extension for
+                     the temp file (important for whisper's container detection).
+
+    Returns:
+        The transcribed text as a single stripped string.
 
     Raises:
         ValueError: If audio_bytes is empty.
-        Exception:  If the Gemini API request fails.
+        RuntimeError: If transcription yields no segments.
     """
     if not audio_bytes:
-        raise ValueError("Audio bytes cannot be empty")
+        raise ValueError("Audio bytes cannot be empty.")
 
-    mime_type = _resolve_mime_type(filename)
+    # Derive the extension from the original filename so whisper picks up the
+    # correct container format (.m4a, .3gp, .wav, etc.).
+    ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ".wav"
+
     logger.info(
-        f"Initializing Gemini-2.5-Flash multimodal request — "
-        f"mime_type='{mime_type}' buffer_size={len(audio_bytes):,} bytes."
+        f"[Whisper] Starting transcription — filename='{filename}' "
+        f"ext='{ext}' buffer_size={len(audio_bytes):,} bytes."
     )
 
+    # Write to a named temp file. delete=False keeps the file on disk while
+    # we pass the path to whisper, then we clean it up manually.
+    tmp_path = None
     try:
-        # Wrap the raw audio bytes in a Part using the Gemini-native MIME type.
-        # Remapped containers (m4a, 3gp) declare audio/aac so Gemini reads the
-        # underlying codec stream without enforcing a strict container boundary.
-        audio_part = types.Part.from_bytes(
-            data=audio_bytes,
-            mime_type=mime_type
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+
+        model = _get_whisper_model()
+        segments, info = model.transcribe(tmp_path, beam_size=1)
+
+        transcription = "".join(segment.text for segment in segments).strip()
+        logger.info(
+            f"[Whisper] Transcription complete — lang='{info.language}' "
+            f"prob={info.language_probability:.2f} text='{transcription}'"
         )
 
-        prompt = (
-            "Analyze this audio expense description and extract the expense information. "
-            "Assume today's date is strictly Sunday, May 31, 2026. "
-            "Use this reference date context to resolve relative temporal words like 'today', 'yesterday', or 'this morning'."
-        )
+        if not transcription:
+            raise RuntimeError("Whisper returned an empty transcription. Try speaking more clearly.")
 
-        # Call gemini-2.5-flash with structured output schema configuration
-        response = get_genai_client().models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[audio_part, prompt],
+        return transcription
+
+    finally:
+        # Always clean up the temp file even if transcription fails.
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+            logger.debug(f"[Whisper] Temp file deleted: {tmp_path}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# STEP 2 — GEMINI TEXT-ONLY ENTITY EXTRACTION
+# ─────────────────────────────────────────────────────────────────────────────
+# Takes the plain transcription text and sends it to Gemini as a *text-only*
+# request (no audio bytes, no multimodal). This avoids all audio-quota limits
+# and works reliably since the input is just a short sentence.
+# ═════════════════════════════════════════════════════════════════════════════
+
+_genai_client: genai.Client | None = None
+
+
+def _get_genai_client() -> genai.Client:
+    """
+    Returns a lazily-loaded, cached Google GenAI client.
+    Reads the API key from the GOOGLE_API_KEY environment variable.
+    """
+    global _genai_client
+    if _genai_client is None:
+        try:
+            _genai_client = genai.Client()
+            logger.info("[Gemini Text] GenAI client initialized.")
+        except Exception as e:
+            logger.error(
+                f"[Gemini Text] Failed to initialize GenAI client: {e}. "
+                "Make sure GOOGLE_API_KEY environment variable is set."
+            )
+            raise
+    return _genai_client
+
+
+def extract_expense_from_text(transcription: str) -> dict:
+    """
+    Extracts structured expense data from a plain-text transcription using
+    Gemini text-only API with structured JSON output.
+
+    This is much cheaper and faster than the multimodal audio approach because
+    the input is just a short text sentence (~10–30 tokens).
+
+    Args:
+        transcription: The plain-text transcription from the local Whisper STT.
+
+    Returns:
+        A dict with keys: amount (int), category (str), date (str YYYY-MM-DD),
+        transcript (str, the original transcription text).
+
+    Raises:
+        Exception: If the Gemini API request fails.
+    """
+    today_str = datetime.date.today().strftime("%A, %B %d, %Y")
+    today_iso = datetime.date.today().isoformat()
+
+    logger.info(f"[Gemini Text] Extracting entities from: '{transcription}'")
+
+    try:
+        response = _get_genai_client().models.generate_content(
+            model="gemini-3.5-flash",
+            contents=(
+                f"Today's date is {today_str} ({today_iso}).\n"
+                f"Parse this expense statement and extract the details:\n"
+                f"\"{transcription}\"\n\n"
+                "Return ONLY a valid JSON object with these exact keys:\n"
+                "{ \"amount\": <integer>, \"category\": \"<one of: Dining, Transport, Housing, "
+                "Shopping, Entertainment, Healthcare, Education, Other>\", \"date\": \"<YYYY-MM-DD>\" }\n"
+                "Use today's date for 'today', yesterday's date for 'yesterday', etc.\n"
+                "The amount must be a plain integer (no currency symbol, no decimals)."
+            ),
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=ExpenseExtraction,
                 system_instruction=(
-                    "You are an expert NLP financial entity extraction assistant for Expenzo.\n"
-                    "Your task is to parse a voice audio recording of an expense and extract the amount, category, and date.\n"
-                    "Today's date context is strictly Sunday, May 31, 2026."
-                )
-            )
+                    "You are a financial data extraction assistant for the Expenzo app.\n"
+                    "Extract expense amount, category, and date from the user's text.\n"
+                    f"Today's date is {today_str}. Resolve all relative dates correctly."
+                ),
+            ),
         )
     except Exception as e:
-        logger.error(f"Gemini API request failed: {e}")
+        logger.error(f"[Gemini Text] API request failed: {e}")
         raise
 
-    # Convert the parsed model back to a dictionary and inject the recreated transcript text
+    # Prefer the pre-parsed Pydantic object if available
     if hasattr(response, "parsed") and response.parsed is not None:
         extracted = response.parsed
         result = {
             "amount": int(extracted.amount),
             "category": str(extracted.category).strip(),
             "date": str(extracted.date).strip(),
-            "transcript": f"Spent {extracted.amount} on {extracted.category} {extracted.date}"
+            "transcript": transcription,
         }
     else:
-        # Fallback raw text parsing if parsed attribute is missing
+        # Fallback: parse the raw JSON text manually
         raw_text = response.text
-        logger.warning(f"Response not pre-parsed. Parsing manually: {raw_text}")
-        extracted_data = json.loads(raw_text)
+        logger.warning(f"[Gemini Text] Response not pre-parsed, parsing manually: {raw_text}")
+        data = json.loads(raw_text)
         result = {
-            "amount": int(extracted_data.get("amount", 0)),
-            "category": str(extracted_data.get("category", "")).strip(),
-            "date": str(extracted_data.get("date", "")).strip(),
-            "transcript": f"Spent {extracted_data.get('amount', 0)} on {extracted_data.get('category', '')} {extracted_data.get('date', '')}"
+            "amount": int(data.get("amount", 0)),
+            "category": str(data.get("category", "Other")).strip(),
+            "date": str(data.get("date", today_iso)).strip(),
+            "transcript": transcription,
         }
 
-    logger.info(f"Gemini multimodal extraction succeeded. Result: {result}")
+    logger.info(f"[Gemini Text] Extraction succeeded: {result}")
+    return result
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PUBLIC API — called by main.py
+# ═════════════════════════════════════════════════════════════════════════════
+
+def process_voice_audio(audio_bytes: bytes, filename: str = "audio_upload.wav") -> dict:
+    """
+    Full two-step voice expense pipeline:
+      1. Transcribe audio locally using faster-whisper (zero API cost).
+      2. Extract {amount, category, date} from the transcription text using
+         Gemini text-only API (cheap text tokens, no audio quota needed).
+
+    Args:
+        audio_bytes: Raw binary content read from the UploadFile memory buffer.
+        filename:    Original upload filename — used to derive the audio
+                     container extension for the temp file.
+
+    Returns:
+        dict with keys: amount (int), category (str), date (str), transcript (str).
+
+    Raises:
+        ValueError: If audio_bytes is empty or transcription is empty.
+        Exception:  If either the Whisper or Gemini step fails.
+    """
+    # Step 1: Local STT
+    transcription = transcribe_audio_locally(audio_bytes, filename=filename)
+
+    # Step 2: Cloud text extraction (text-only, no audio quota)
+    result = extract_expense_from_text(transcription)
+
     return result

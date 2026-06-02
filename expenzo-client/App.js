@@ -14,7 +14,11 @@ import {
   Image,
   Alert,
   Platform,
+  LogBox,
 } from 'react-native';
+
+// Suppress the warning/error thrown by expo-notifications in Expo Go
+LogBox.ignoreLogs(['expo-notifications: Android Push notifications']);
 import {
   Mic,
   Folder,
@@ -49,16 +53,62 @@ import {
 import Svg, { Path, Defs, LinearGradient, Stop } from 'react-native-svg';
 import { Audio } from 'expo-av';
 import * as Notifications from 'expo-notifications';
+import * as FileSystem from 'expo-file-system';
 
 // ─── Local Supabase helpers ───────────────────────────────────────────────────
 import { getProjects, getExpenses, insertProject, insertExpense } from './lib/supabase';
 import { signUp, signIn, signOut, getSession } from './lib/auth';
 
+// ─── Voice Pipeline: handled by PC backend (faster-whisper + Gemini text) ────
+// The app uploads the audio file to the FastAPI backend at API_URL/expense/voice.
+// The backend transcribes locally with faster-whisper and extracts entities
+// with Gemini text-only API, then saves to Supabase and returns the result.
+// No API key or audio processing happens client-side.
+
+/**
+ * Uploads the recorded audio file to the PC backend for local STT processing.
+ * Backend handles: faster-whisper transcription → Gemini text extraction → Supabase save.
+ * Returns the full { expense, analytics } response from the backend.
+ */
+async function uploadAudioToBackend(audioUri, projectId, backendUrl) {
+  const ext = audioUri.split('.').pop().toLowerCase() || 'm4a';
+  const filename = `recording.${ext}`;
+
+  const formData = new FormData();
+  formData.append('audio', {
+    uri: audioUri,
+    name: filename,
+    type: 'audio/aac', // React Native FormData requires a MIME type
+  });
+  formData.append('project_id', projectId);
+
+  console.log(`[Backend] Uploading audio to ${backendUrl}/expense/voice ...`);
+
+  const res = await fetch(`${backendUrl}/expense/voice`, {
+    method: 'POST',
+    body: formData,
+    // Do NOT set Content-Type manually — let fetch set the multipart/form-data boundary
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Backend error ${res.status}: ${errText.slice(0, 300)}`);
+  }
+
+  return await res.json(); // { message, expense, analytics }
+}
+
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
 // ─── API Configuration ────────────────────────────────────────────────────────
-const API_URL = 'http://localhost:8000';
-const ANDROID_API_URL = 'http://10.0.2.2:8000';
+// Use your PC's LAN IP (run `ipconfig` to find it).
+// Both ports (8000 and 8001) are tried in order; the first reachable one is used.
+const BACKEND_URLS = [
+  'http://192.168.1.7:8000',
+  'http://192.168.1.7:8001',
+  'http://10.0.2.2:8000',
+  'http://10.0.2.2:8001',
+];
 
 // ─── Notification Configuration ───────────────────────────────────────────────
 Notifications.setNotificationHandler({
@@ -294,7 +344,7 @@ export default function App() {
       // Avoid stale backendHealthy state: try primary URL first, fall back to
       // the Android emulator URL if the primary request fails.
       let data = null;
-      for (const url of [API_URL, ANDROID_API_URL]) {
+      for (const url of BACKEND_URLS) {
         try {
           const res = await fetch(`${url}/analytics/burn-rate?project_id=${projectId}`);
           if (res.ok) {
@@ -355,14 +405,15 @@ export default function App() {
         setTimeout(() => controller.abort(), ms);
         return controller.signal;
       };
-      try {
-        const r = await fetch(`${API_URL}/health`, { signal: makeSignal(2000) });
-        if (r.ok) { setBackendHealthy(true); return; }
-      } catch {}
-      try {
-        const r = await fetch(`${ANDROID_API_URL}/health`, { signal: makeSignal(2000) });
-        if (r.ok) { setBackendHealthy(true); return; }
-      } catch {}
+      for (const url of BACKEND_URLS) {
+        try {
+          const r = await fetch(`${url}/health`, { signal: makeSignal(1500) });
+          if (r.ok) {
+            setBackendHealthy(true);
+            return;
+          }
+        } catch {}
+      }
       setBackendHealthy(false);
     };
     check();
@@ -403,7 +454,7 @@ export default function App() {
   // AUTH HANDLERS
   // ══════════════════════════════════════════════════════════════════════════
   const handleRegister = async () => {
-    if (!registerName || !registerEmail || !registerPassword) {
+    if (!registerName.trim() || !registerEmail.trim() || !registerPassword) {
       Alert.alert('Missing Fields', 'Please fill in all fields.');
       return;
     }
@@ -416,31 +467,84 @@ export default function App() {
       return;
     }
     setAuthLoading(true);
-    const { user, error } = await signUp(registerEmail, registerPassword, registerName);
-    setAuthLoading(false);
+    const { user, session, error } = await signUp(registerEmail.trim(), registerPassword, registerName.trim());
 
     if (error) {
+      setAuthLoading(false);
       Alert.alert('Registration Failed', error.message);
       return;
     }
 
-    setCurrentUser(user);
-    Alert.alert(
-      '✅ Account Created!',
-      'Welcome to Expenzo! Check your email to confirm your account, then log in.',
-      [{ text: 'OK', onPress: () => setCurrentScreen('LOGIN') }]
-    );
+    if (session) {
+      setAuthLoading(false);
+      setCurrentUser(user);
+      setIsAuthenticated(true);
+      setCurrentScreen('MAIN');
+      fetchInitialData();
+      Alert.alert('🎉 Welcome!', `Account created and logged in as ${registerName.trim()}!`);
+    } else {
+      // Attempt login immediately
+      const { user: loggedInUser, error: loginError } = await signIn(registerEmail.trim(), registerPassword);
+      setAuthLoading(false);
+
+      if (loginError) {
+        Alert.alert(
+          '✅ Account Created!',
+          'Your account was created successfully. Please check your email to confirm your account, then log in.',
+          [{ text: 'OK', onPress: () => setCurrentScreen('LOGIN') }]
+        );
+      } else {
+        setCurrentUser(loggedInUser);
+        setIsAuthenticated(true);
+        setCurrentScreen('MAIN');
+        fetchInitialData();
+        Alert.alert('🎉 Welcome!', `Account created and logged in as ${registerName.trim()}!`);
+      }
+    }
   };
 
-  const handleLogin = () => {
-    // Bypass Supabase auth to avoid the read-only 'NONE' property mutation crash.
-    // Both the Continue button and the Google Connection Link button call this.
+  const handleLogin = async () => {
+    // Validate inputs first
+    if (!loginEmail.trim()) {
+      Alert.alert('Missing Email', 'Please enter your email address.');
+      return;
+    }
+    if (!loginPassword.trim()) {
+      Alert.alert('Missing Password', 'Please enter your password.');
+      return;
+    }
+
     setLoading(true);
-    setIsAuthenticated(true);
+    const { user, error } = await signIn(loginEmail.trim(), loginPassword);
     setLoading(false);
+
+    if (error) {
+      // Show a human-readable error message
+      const msg = error.message || 'Login failed. Please check your credentials.';
+      Alert.alert('Login Failed', msg);
+      return;
+    }
+
+    if (!user) {
+      Alert.alert('Login Failed', 'No user found. Please check your credentials.');
+      return;
+    }
+
+    // Successfully authenticated
+    setCurrentUser(user);
+    setIsAuthenticated(true);
     setCurrentScreen('MAIN');
     fetchInitialData();
   };
+
+  const handleGoogleLogin = () => {
+    Alert.alert(
+      'Google Sign-In',
+      'Google OAuth requires a development build and cannot run inside Expo Go. Please use email and password to sign in.',
+      [{ text: 'OK' }]
+    );
+  };
+
 
   const handleSignOut = async () => {
     Alert.alert('Sign Out', 'Are you sure you want to sign out?', [
@@ -523,8 +627,7 @@ export default function App() {
 
   const stopRecordingAndProcess = async () => {
     if (!recordingRef.current) {
-      // Fallback simulation if recording never started
-      triggerVoiceSimulation();
+      Alert.alert('No Recording', 'Please tap the mic and speak before stopping.');
       return;
     }
 
@@ -532,65 +635,66 @@ export default function App() {
     setIsListening(false);
     setIsProcessing(true);
 
+    let uri = null;
     try {
       await recordingRef.current.stopAndUnloadAsync();
-      const uri = recordingRef.current.getURI();
+      uri = recordingRef.current.getURI();
       recordingRef.current = null;
-
       await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
-
       console.log('[Audio] Recording stopped. URI:', uri);
+    } catch (stopErr) {
+      console.error('[Audio] Failed to stop recording:', stopErr.message);
+      setIsProcessing(false);
+      Alert.alert('Recording Error', 'Failed to stop recording. Please try again.');
+      return;
+    }
 
-      // Upload to FastAPI
-      const activeUrl = backendHealthy ? API_URL : ANDROID_API_URL;
+    try {
+      // ─── Upload audio to PC backend — faster-whisper STT + Gemini text extraction ───
+      // Try the primary LAN URL first, fall back to Android emulator URL if it fails.
+      let response = null;
+      let lastError = null;
 
-      // Dynamically resolve the true container format from the recorded URI
-      // so the multipart boundary matches what the device actually produced.
-      const fileExtension = uri.split('.').pop();
-
-      const formData = new FormData();
-      formData.append('audio', {
-        uri,
-        name: `audioInput.${fileExtension}`,
-        type: fileExtension === 'm4a' ? 'audio/m4a' : 'audio/3gpp',
-      });
-      formData.append('project_id', activeProjectId || 'default');
-
-      const res = await fetch(`${activeUrl}/expense/voice`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'multipart/form-data' },
-        body: formData,
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        const exp = data.expense;
-
-        // Save to Supabase
+      for (const url of BACKEND_URLS) {
         try {
-          const saved = await insertExpense({
-            project_id: activeProjectId,
-            amount: exp.amount,
-            date: exp.date,
-            category: exp.category,
-            transcript: exp.transcript,
-          });
-          setExpenses(prev => [saved, ...prev]);
-          setIsProcessing(false);
-          await fireHealthNotification(data.analytics);
-          Alert.alert('🎙️ Voice Logged!', `Spent ₹${exp.amount} on ${exp.category}`);
-        } catch (supaErr) {
-          // Backend parsed it — just use local state even if Supabase write failed
-          setExpenses(prev => [{ id: Date.now().toString(), project_id: activeProjectId, ...exp }, ...prev]);
-          setIsProcessing(false);
-          Alert.alert('🎙️ Voice Logged (local)', `Saved locally — Supabase write failed.`);
+          console.log(`[Backend] Trying ${url}/expense/voice ...`);
+          response = await uploadAudioToBackend(uri, activeProjectId, url);
+          console.log('[Backend] Voice pipeline response:', response);
+          break; // Success — stop trying fallback URLs
+        } catch (uploadErr) {
+          console.warn(`[Backend] ${url} failed:`, uploadErr.message);
+          lastError = uploadErr;
         }
-      } else {
-        throw new Error(`Backend returned ${res.status}`);
       }
+
+      if (!response) {
+        throw lastError || new Error('All backend URLs failed. Is the uvicorn server running?');
+      }
+
+      // Backend already saved to Supabase — add the returned expense to local state
+      const exp = response.expense;
+      if (exp) {
+        setExpenses(prev => [exp, ...prev]);
+      }
+      setIsProcessing(false);
+      Alert.alert(
+        '🎙️ Voice Logged!',
+        `Detected: "${exp?.transcript || 'expense recorded'}"\n\n` +
+        `✔ ₹${exp?.amount ?? '?'} in ${exp?.category ?? 'Other'} on ${exp?.date ?? 'today'}`
+      );
     } catch (err) {
-      console.warn('[Voice] Upload failed, using simulation:', err.message);
-      triggerVoiceSimulation();
+      console.error('[Voice] Backend pipeline failed:', err.message);
+      setIsProcessing(false);
+      Alert.alert(
+        '⚠️ Voice Processing Failed',
+        `Could not reach the backend server.\n\n` +
+        `Make sure:\n` +
+        `1. uvicorn is running on your PC (port 8000 or 8001)\n` +
+        `2. Your phone and PC are on the same Wi-Fi network\n` +
+        `3. BACKEND_URLS in App.js matches your PC's IP address\n\n` +
+        `Error: ${err.message.slice(0, 120)}`,
+        [{ text: 'OK' }]
+      );
     }
   };
 
@@ -957,7 +1061,7 @@ export default function App() {
                 </TouchableOpacity>
               </View>
 
-              {/* ── Continue button — bypasses Supabase auth library crash ── */}
+              {/* ── Continue button — calls real Supabase signIn ── */}
               <TouchableOpacity
                 style={[styles.onboardingButton, { marginTop: 36, width: '100%', justifyContent: 'center', paddingVertical: 16 }]}
                 onPress={handleLogin}
@@ -969,7 +1073,7 @@ export default function App() {
                 }
               </TouchableOpacity>
 
-              {/* ── Google Connection Link — also bypasses Supabase auth ── */}
+              {/* ── Continue with Google — not supported in Expo Go ── */}
               <TouchableOpacity
                 style={[
                   styles.onboardingButton,
@@ -983,7 +1087,7 @@ export default function App() {
                     borderColor: 'rgba(165,180,252,0.25)',
                   }
                 ]}
-                onPress={handleLogin}
+                onPress={handleGoogleLogin}
                 disabled={loading}
               >
                 <Text style={[styles.onboardingButtonText, { fontSize: 15, color: '#A5B4FC' }]}>

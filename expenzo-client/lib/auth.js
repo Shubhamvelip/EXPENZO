@@ -5,17 +5,14 @@ import { supabase } from './supabase';
  * Returns { user, session, error }.
  */
 export async function signUp(email, password, name) {
-  console.log('[Auth] signUp (bypassed) for:', email);
-  const mockUser = {
-    id: 'mock-user-id',
+  const { data, error } = await supabase.auth.signUp({
     email,
-    user_metadata: { full_name: name },
-  };
-  const mockSession = {
-    access_token: 'mock-access-token',
-    user: mockUser,
-  };
-  return { user: mockUser, session: mockSession, error: null };
+    password,
+    options: {
+      data: { full_name: name },
+    },
+  });
+  return { user: data?.user ?? null, session: data?.session ?? null, error };
 }
 
 /**
@@ -23,42 +20,33 @@ export async function signUp(email, password, name) {
  * Returns { user, session, error }.
  */
 export async function signIn(email, password) {
-  console.log('[Auth] signIn (bypassed) for:', email);
-  const mockUser = {
-    id: 'mock-user-id',
-    email: email || 'user@example.com',
-    user_metadata: { full_name: 'Mock User' },
-  };
-  const mockSession = {
-    access_token: 'mock-access-token',
-    user: mockUser,
-  };
-  return { user: mockUser, session: mockSession, error: null };
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email,
+    password,
+  });
+  return { user: data?.user ?? null, session: data?.session ?? null, error };
 }
 
 /**
  * Sign out the currently authenticated user.
  */
 export async function signOut() {
-  console.log('[Auth] signOut (bypassed)');
+  await supabase.auth.signOut();
 }
 
 /**
  * Get the current session. Returns null if not authenticated.
  */
 export async function getSession() {
-  // Return null so users are directed to the onboarding/login screens.
-  // Once they log in or sign up, their session state will be updated.
-  return null;
+  const { data } = await supabase.auth.getSession();
+  return data?.session ?? null;
 }
 
 /**
  * Get the currently authenticated user object.
  */
 export async function getCurrentUser() {
-  return {
-    id: 'mock-user-id',
-    email: 'user@example.com',
-    user_metadata: { full_name: 'Mock User' },
-  };
+  const { data } = await supabase.auth.getUser();
+  return data?.user ?? null;
 }
+

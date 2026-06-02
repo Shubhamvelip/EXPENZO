@@ -38,7 +38,8 @@ export async function getProjects() {
  * Returns the newly created project object.
  */
 export async function insertProject({ name, total_budget, type = 'Personal', color = '#818CF8', icon = 'Folder' }) {
-  const user = { id: 'mock-user-id' };
+  const { data: { user } } = await supabase.auth.getUser();
+  const userId = user?.id || null;
 
   const { data, error } = await supabase
     .from('projects')
@@ -48,7 +49,7 @@ export async function insertProject({ name, total_budget, type = 'Personal', col
       type,
       color,
       icon,
-      user_id: user?.id ?? null,
+      user_id: userId,
     }])
     .select();
 
@@ -89,7 +90,8 @@ export async function getExpenses(projectId = null) {
  * Returns the newly created expense object.
  */
 export async function insertExpense({ project_id, amount, date, category, transcript }) {
-  const user = { id: 'mock-user-id' };
+  const { data: { user } } = await supabase.auth.getUser();
+  const userId = user?.id || null;
 
   const { data, error } = await supabase
     .from('expenses')
@@ -99,7 +101,7 @@ export async function insertExpense({ project_id, amount, date, category, transc
       date,
       category,
       transcript: transcript || '',
-      user_id: user?.id ?? null,
+      user_id: userId,
     }])
     .select();
 
